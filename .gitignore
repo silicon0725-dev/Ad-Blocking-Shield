@@ -1,0 +1,38 @@
+# --- 私密/本机数据: 绝不能进公开仓库 ---
+# 本机生成的 mitmproxy CA (含私钥!)
+mitmproxy-ca*
+*.pem
+*.key
+*.p12
+*.cer
+
+# 拦截日志含浏览历史
+mitm/logs/
+
+# 运行时设置(含开关状态, 与人无关但每次运行都会变)
+gui/settings.json
+
+# Clash 相关一律不入库 (含订阅!)
+*.yaml
+backup-baseline/
+verge.yaml
+
+# --- 构建产物 ---
+build/dist/
+build/build/
+build/work*/
+build/__pycache__/
+build/*.log
+__pycache__/
+*.pyc
+
+# exe 体积巨大且平台绑定, 用 GitHub Releases 分发而不是 git
+bin/
+
+# --- 系统 ---
+Thumbs.db
+desktop.ini
+*.lnk
+
+# 运行调试日志
+*.log
