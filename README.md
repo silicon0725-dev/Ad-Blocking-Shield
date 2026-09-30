@@ -25,6 +25,7 @@ AdBlock Console inserts a filtering HTTPS proxy between your apps and your Clash
 
 - **Selective TLS decryption.** Only connections whose SNI matches an ad/tracker candidate derived from the rule set are decrypted and inspected. Everything else is tunneled untouched, so the origin server sees the browser's real TLS fingerprint — no more `502` / "peer closed connection" breakage on Cloudflare-protected or certificate-pinning sites.
 - **~60,000 rules out of the box** — EasyList + EasyList China, plus optional third-party rule subscriptions you can add from the GUI.
+- **EasyList-compatible subset** — the engine implements the core EasyList syntax: `||domain^` anchors, plain keyword/substring patterns, path rules, `@@` exceptions, and the options `$important`, `$third-party`/`~third-party`, `$domain=a|~b`. Advanced options that need browser context (`$script`, `$image`, `$csp`, `$replace`, …) and cosmetic/element-hiding filters (`##`) are ignored — a proxy sees requests, not page DOM.
 - **Personal lists with hot reload** (no restart, effective within seconds):
   - `whitelist` — never filter a site
   - `blacklist` — always block a domain
@@ -60,9 +61,16 @@ AdBlock Console inserts a filtering HTTPS proxy between your apps and your Clash
 
 ### From a release (recommended)
 
-1. Download [`AdShield-v1.0.0.zip`](https://github.com/silicon0725-dev/Ad-Blocking-Shield/releases/download/v1.0.0/AdShield-v1.0.0.zip) (~275 MiB) from the [latest release](https://github.com/silicon0725-dev/Ad-Blocking-Shield/releases/latest) and unzip it — it contains both the GUI (`广告拦截控制台.exe`) and the engine (`mitmdump.exe`).
+1. Download the latest `AdShield-v*.zip` (~275 MiB) from the [releases page](https://github.com/silicon0725-dev/Ad-Blocking-Shield/releases/latest) and unzip it — it contains both the GUI (`广告拦截控制台.exe`) and the engine (`mitmdump.exe`).
 2. Run the GUI, click the power button.
 3. If prompted, install the root CA (current-user store is enough for browsers).
+
+**Scripting:** the GUI exe also accepts `--on` / `--off` / `--hidden` for headless control (same code path as the power button):
+
+```powershell
+& "广告拦截控制台.exe" --on    # enable: starts engine, takes over the system proxy
+& "广告拦截控制台.exe" --off   # disable: stops engine, restores previous proxy/PAC state
+```
 
 ### From source
 

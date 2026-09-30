@@ -22,7 +22,7 @@ os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Material")
 
 from PySide6.QtCore import (QObject, Property, Signal, Slot, QTimer, QUrl, Qt,
                             QAbstractNativeEventFilter)
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
@@ -120,8 +120,59 @@ def set_system_proxy(server):
                        0, winreg.KEY_SET_VALUE)
     winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, server)
     winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+    # PAC 在时会优先生效导致手动代理被绕过, 接管期间移除 (原始值由快照恢复)
+    try:
+        winreg.DeleteValue(k, "AutoConfigURL")
+    except OSError:
+        pass
     winreg.CloseKey(k)
     _refresh_proxy_settings()
+
+
+def read_proxy_full():
+    """完整快照当前代理设置 (含 PAC 与绕过列表)"""
+    vals = {"ProxyEnable": 0, "ProxyServer": "", "ProxyOverride": "", "AutoConfigURL": ""}
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        for name in list(vals):
+            try:
+                vals[name] = winreg.QueryValueEx(k, name)[0]
+            except OSError:
+                pass
+        winreg.CloseKey(k)
+    except OSError:
+        pass
+    return vals
+
+
+def restore_proxy_full(vals):
+    """按快照恢复代理设置; 原快照中没有的值删除, 恢复后广播生效"""
+    k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                       r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                       0, winreg.KEY_SET_VALUE)
+    winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, str(vals.get("ProxyServer", "")))
+    winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, int(bool(vals.get("ProxyEnable"))))
+    for name in ("ProxyOverride", "AutoConfigURL"):
+        if vals.get(name):
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, str(vals[name]))
+        else:
+            try:
+                winreg.DeleteValue(k, name)
+            except OSError:
+                pass
+    winreg.CloseKey(k)
+    _refresh_proxy_settings()
+
+
+def restore_original_proxy():
+    """停用/退出时还原接管前状态; 无快照时回退到 Clash 端口防断网"""
+    snap = load_settings().get("proxy_original")  # 重读磁盘, 兼容另一进程写入的快照
+    if snap and snap.get("ProxyServer"):
+        restore_proxy_full(snap)
+        return "已还原接管前代理 (%s)" % snap["ProxyServer"]
+    set_system_proxy("127.0.0.1:%d" % CLASH_PORT)
+    return "已恢复 → 127.0.0.1:%d (Clash)" % CLASH_PORT
 
 
 def listener_pid(port):
@@ -150,6 +201,44 @@ def kill_pid(pid):
         kernel32.CloseHandle(h)
         return True
     return False
+
+
+def process_image(pid):
+    """按 PID 取进程可执行文件完整路径, 失败返回空串"""
+    h = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    buf = ctypes.create_unicode_buffer(1024)
+    n = wintypes.DWORD(1024)
+    ok = kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n))
+    kernel32.CloseHandle(h)
+    return buf.value if ok else ""
+
+
+def engine_pid():
+    """8080 监听 PID, 仅当确属本程序管理的 mitmdump 时返回, 否则 None"""
+    pid = listener_pid(MITM_PORT)
+    if pid is None:
+        return None
+    img = process_image(pid)
+    md = find_mitmdump()
+    try:
+        if md and img and Path(img).resolve() == Path(md).resolve():
+            return pid
+    except OSError:
+        pass
+    if pid == SETTINGS.get("engine_pid"):  # 镜像路径不匹配时的记录兜底
+        return pid
+    return None
+
+
+def engine_conflict():
+    """8080 被非本程序进程占用 → (pid, image), 否则 None"""
+    pid = listener_pid(MITM_PORT)
+    if pid is None or engine_pid() is not None:
+        return None
+    img = process_image(pid)
+    return pid, img or "未知进程"
 
 
 def tun_adapter_up():
@@ -227,7 +316,11 @@ def start_mitmdump(domain_only=None):
     md = find_mitmdump()
     if not md:
         return False, "找不到 mitmdump (pip install mitmproxy)"
-    if listener_pid(MITM_PORT):
+    conf = engine_conflict()
+    if conf:
+        return False, ("端口 %d 被其他程序占用 (PID %d: %s), 请先关闭该程序"
+                       % (MITM_PORT, conf[0], Path(conf[1]).name))
+    if engine_pid():
         return True, "mitmproxy 已在运行"
     LOGS.mkdir(parents=True, exist_ok=True)
     args = [md, "-s", str(MITM / "adblock.py"), "-p", str(MITM_PORT),
@@ -246,19 +339,33 @@ def start_mitmdump(domain_only=None):
                          creationflags=NO_WINDOW)
     for _ in range(20):
         time.sleep(0.5)
-        if listener_pid(MITM_PORT):
+        pid = engine_pid()
+        if pid:
+            SETTINGS["engine_pid"] = pid
+            save_settings(SETTINGS)
             return True, "mitmproxy 已启动 (%s)" % ("仅域名拦截" if domain_only else "完整模式")
-    return False, "mitmproxy 启动超时, 详见 mitm/logs/mitmdump.log"
+        conf = engine_conflict()
+        if conf:
+            # 我们启动的实例绑定失败已退出, 端口实际被外部进程持有
+            return False, ("端口 %d 被其他程序占用 (PID %d: %s), mitmdump 绑定失败"
+                           % (MITM_PORT, conf[0], Path(conf[1]).name))
+    return False, "mitmdump 启动超时, 详见 mitm/logs/mitmdump.log"
 
 
 def stop_mitmdump():
-    pid = listener_pid(MITM_PORT)
-    if not pid:
+    pid = engine_pid()
+    if pid is None:
+        conf = engine_conflict()
+        if conf:
+            return False, ("8080 被非本程序进程占用 (PID %d: %s), 已拒绝误杀"
+                           % (conf[0], Path(conf[1]).name))
         return True, "mitmproxy 未在运行"
     kill_pid(pid)
     for _ in range(10):
         time.sleep(0.3)
         if listener_pid(MITM_PORT) is None:
+            SETTINGS.pop("engine_pid", None)
+            save_settings(SETTINGS)
             return True, "已停止 mitmproxy"
     return False, "停止 mitmproxy 失败 (PID %d)" % pid
 
@@ -439,7 +546,7 @@ class Backend(QObject):
             self._state.get("recent", [])
         self._blocks_mtime = bm
         proxy_ours = proxy_on and str(MITM_PORT) in (server or "")
-        mitm_on = listener_pid(MITM_PORT) is not None
+        mitm_on = engine_pid() is not None
         new_state = dict(
             mitm=mitm_on,
             proxy=proxy_ours,
@@ -573,6 +680,12 @@ class Backend(QObject):
     @Slot()
     def enable(self):
         def work():
+            # 接管前快照原始代理/PAC 状态 (当前已指向 8080 时不覆盖真实原始值)
+            cur_on, cur_server = get_system_proxy()
+            ours = "127.0.0.1:%d" % MITM_PORT
+            snap = read_proxy_full()
+            if (cur_server or "") != ours and str(snap.get("ProxyServer", "")) != ours:
+                SETTINGS["proxy_original"] = snap
             ok, msg = start_mitmdump()
             if not ok:
                 self.message.emit("❌ " + msg)
@@ -597,9 +710,10 @@ class Backend(QObject):
             # 先落 last_enabled 再改代理, 保证守护不会把停用操作改回去
             SETTINGS["last_enabled"] = False
             save_settings(SETTINGS)
-            stop_mitmdump()
-            set_system_proxy("127.0.0.1:%d" % CLASH_PORT)
-            self.message.emit("⏹ 已停用, 系统代理恢复 → 127.0.0.1:7897 (Clash)")
+            stop_result = stop_mitmdump()
+            msg = restore_original_proxy()
+            self.message.emit("⏹ 已停用, %s" % msg + ("" if stop_result[0]
+                                                      else "；⚠️ " + stop_result[1]))
             self._refresh()
         threading.Thread(target=work, daemon=True).start()
 
@@ -613,11 +727,12 @@ class Backend(QObject):
         def work():
             SETTINGS["last_enabled"] = False
             save_settings(SETTINGS)
-            stop_mitmdump()
-            set_system_proxy("127.0.0.1:%d" % CLASH_PORT)
+            stop_result = stop_mitmdump()
+            msg = restore_original_proxy()
             ca_remove()
             self._ca_cache = (False, time.time())
-            self.message.emit("↩ 已彻底回滚 (含删除 mitmproxy CA)")
+            self.message.emit("↩ 已彻底回滚 (%s, 含删除 mitmproxy CA)" % msg
+                              + ("" if stop_result[0] else "；⚠️ " + stop_result[1]))
             self._refresh()
         threading.Thread(target=work, daemon=True).start()
 
@@ -691,7 +806,7 @@ class Backend(QObject):
         self._restarting = True
         def work():
             try:
-                if listener_pid(MITM_PORT):
+                if engine_pid():
                     ok, msg = restart_mitmdump()
                     self.message.emit(("🌿 已切换为仅域名拦截(不解密, 低功耗) " if on
                                        else "🔍 已切换为完整拦截(域名+路径) ")
@@ -778,7 +893,7 @@ class Backend(QObject):
                     f = LISTS / (s["name"] + ".txt")
                     if f.is_file():
                         f.unlink()
-            if ok_all and listener_pid(MITM_PORT):
+            if ok_all and engine_pid():
                 self._restarting = True
                 try:
                     stop_mitmdump()
@@ -805,20 +920,70 @@ def make_icon(enabled=True):
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
-    p.setBrush(QColor("#22c55e" if enabled else "#64748b"))
+    base = QColor("#22c55e" if enabled else "#64748b")
+    p.setBrush(base)
     p.setPen(Qt.NoPen)
     p.drawRoundedRect(4, 4, 56, 56, 14, 14)
-    p.setPen(QColor("white"))
-    f = p.font()
-    f.setBold(True)
-    f.setPixelSize(34)
-    p.setFont(f)
-    p.drawText(pm.rect(), Qt.AlignCenter, "盾")
+    # 矢量盾牌 (与 exe 图标同款, 坐标按 64 基准)
+    sh = QPainterPath()
+    sh.moveTo(32, 11)
+    sh.cubicTo(26, 11, 18.5, 12.5, 14.5, 15.5)
+    sh.lineTo(14.5, 29)
+    sh.cubicTo(14.5, 38, 23, 46, 32, 53)
+    sh.cubicTo(41, 46, 49.5, 38, 49.5, 29)
+    sh.lineTo(49.5, 15.5)
+    sh.cubicTo(45.5, 12.5, 38, 11, 32, 11)
+    sh.closeSubpath()
+    p.setBrush(QColor("white"))
+    p.drawPath(sh)
+    pen = QPen(base.darker(160))
+    pen.setWidthF(5)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    chk = QPainterPath()
+    chk.moveTo(23.5, 29.5)
+    chk.lineTo(30, 36)
+    chk.lineTo(41, 23.5)
+    p.drawPath(chk)
     p.end()
     return QIcon(pm)
 
 
+def _cli_on():
+    """脚本化启用 (exe --on): 与 GUI 电源按钮完全同一套模块函数"""
+    cur_on, cur_server = get_system_proxy()
+    ours = "127.0.0.1:%d" % MITM_PORT
+    snap = read_proxy_full()
+    if (cur_server or "") != ours and str(snap.get("ProxyServer", "")) != ours:
+        SETTINGS["proxy_original"] = snap
+        save_settings(SETTINGS)
+    ok, msg = start_mitmdump()
+    if not ok:
+        print("[cli] FAIL " + msg)
+        return 1
+    set_system_proxy(ours)
+    SETTINGS["last_enabled"] = True
+    save_settings(SETTINGS)
+    print("[cli] OK %s | proxy -> %s" % (msg, ours))
+    return 0
+
+
+def _cli_off():
+    """脚本化停用 (exe --off)"""
+    SETTINGS["last_enabled"] = False
+    save_settings(SETTINGS)
+    ok, msg = stop_mitmdump()
+    print("[cli] engine: " + msg)
+    print("[cli] proxy:  " + restore_original_proxy())
+    return 0 if ok else 1
+
+
 def main():
+    if "--on" in sys.argv:                     # 脚本化开关, 不启动 GUI
+        return _cli_on()
+    if "--off" in sys.argv:
+        return _cli_off()
     app = QApplication(sys.argv)
     app.setApplicationName("广告拦截控制台")
     app.setQuitOnLastWindowClosed(False)      # 关窗缩到托盘
@@ -908,10 +1073,11 @@ def main():
     server.newConnection.connect(_on_new_conn)
 
     def on_quit():
-        # 一致性保障: 退出时若 MITM 未运行而系统代理仍指向 8080, 恢复为 7897 防止断网
+        # 一致性保障: 退出时若 MITM 未运行(含 8080 被外部进程占用)而系统代理仍指向 8080,
+        # 还原接管前状态防止断网
         p_on, server_addr = get_system_proxy()
-        if p_on and str(MITM_PORT) in (server_addr or "") and listener_pid(MITM_PORT) is None:
-            set_system_proxy("127.0.0.1:%d" % CLASH_PORT)
+        if p_on and str(MITM_PORT) in (server_addr or "") and engine_pid() is None:
+            restore_original_proxy()
         app.quit()
     act_quit.triggered.connect(on_quit)
 
