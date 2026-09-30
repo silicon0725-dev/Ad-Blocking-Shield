@@ -60,7 +60,7 @@ AdBlock Console inserts a filtering HTTPS proxy between your apps and your Clash
 
 ### From a release (recommended)
 
-1. Put `广告拦截控制台.exe` (GUI) and `mitmdump.exe` (engine) together in a `bin\` folder.
+1. Download [`AdShield-v1.0.0.zip`](https://github.com/silicon0725-dev/Ad-Blocking-Shield/releases/download/v1.0.0/AdShield-v1.0.0.zip) (~275 MiB) from the [latest release](https://github.com/silicon0725-dev/Ad-Blocking-Shield/releases/latest) and unzip it — it contains both the GUI (`广告拦截控制台.exe`) and the engine (`mitmdump.exe`).
 2. Run the GUI, click the power button.
 3. If prompted, install the root CA (current-user store is enough for browsers).
 
